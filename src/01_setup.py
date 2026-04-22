@@ -1,10 +1,3 @@
-"""
-01_setup.py
-===========
-Environment setup and package installation.
-Run this first in every new Colab session before anything else.
-"""
-
 import subprocess
 subprocess.run([
     "pip", "install", "-q",
@@ -20,7 +13,7 @@ if torch.cuda.is_available():
 
 #HuggingFace login
 from huggingface_hub import login
-login(token="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")   # replace with your token
+login(token="your_hf_token")   # replace with your token
 
 import os
 os.makedirs("data",    exist_ok=True)
