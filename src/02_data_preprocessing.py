@@ -1,7 +1,5 @@
 """
-02_data_preprocessing.py
 Load, clean, and LLM-score Finance-Instruct-500k to build the training set.
-Outputs: data/quality_scored.csv and data/model2_train.parquet
 """
 
 import os
