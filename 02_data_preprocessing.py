@@ -1,0 +1,141 @@
+"""
+Load Finance-Instruct-500k, clean it, and run LLM-based quality
+scoring to build the fine-tuning training set.
+"""
+
+import re, asyncio, os
+import numpy as np
+import pandas as pd
+import anthropic
+from datasets import load_dataset
+
+np.random.seed(42)
+
+#Local paths
+os.makedirs("data", exist_ok=True)
+SAVE_PATH = "data/quality_scored.csv"
+
+#Load from HuggingFace (not local)
+print("Loading Finance-Instruct-500k...")
+dataset = load_dataset("Josephgflowers/Finance-Instruct-500k")
+df      = dataset['train'].to_pandas()
+print(f"Loaded: {len(df):,} rows")
+
+#Step 2: Remove Chinese rows
+def contains_chinese(text):
+    if not isinstance(text, str): return False
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+chinese_mask = (
+    df['user'].apply(contains_chinese) |
+    df['assistant'].apply(contains_chinese) |
+    df['system'].apply(contains_chinese)
+)
+df_clean = df[~chinese_mask].reset_index(drop=True)
+print(f"After removing Chinese: {len(df_clean):,} rows (removed {chinese_mask.sum():,})")
+
+# Remove too-short rows
+df_clean['system_stripped'] = df_clean['system'].str.strip()
+length_mask = (
+    (df_clean['user'].str.strip().str.len() > 20) &
+    (df_clean['assistant'].str.strip().str.len() > 50)
+)
+df_clean = df_clean[length_mask].reset_index(drop=True)
+print(f"After length filter: {len(df_clean):,} rows")
+
+#Step 4: Split by system prompt
+df_train     = df_clean[df_clean['system_stripped'] == ''].reset_index(drop=True)
+df_train_sys = df_clean[df_clean['system_stripped'].str.len() >= 5].reset_index(drop=True)
+print(f"Without system prompt: {len(df_train):,} rows")
+print(f"With system prompt   : {len(df_train_sys):,} rows")
+
+#Step 5: LLM quality scoring
+os.environ['ANTHROPIC_API_KEY'] = "your-anthropic-key"   # replace
+client = anthropic.AsyncAnthropic()
+
+TARGET_VALID      = 5000
+BATCH_SIZE        = 1000
+MAX_ROWS          = 50000
+MAX_CONCURRENT    = 10
+QUALITY_THRESHOLD = 3
+
+async def score_row_async(user_text, assistant_text):
+    prompt = f"""You are evaluating a finance Q&A pair for LLM training quality.
+Score it from 1 to 5:
+- 1: Unusable (orphan entry, references missing text, gibberish, off-topic)
+- 2: Poor (vague, inaccurate, or heavily incomplete)
+- 3: Acceptable (correct but shallow or generic)
+- 4: Good (accurate, reasonably detailed, on-topic finance)
+- 5: Excellent (accurate, detailed, clear financial reasoning)
+
+QUESTION: {user_text[:400]}
+ANSWER: {assistant_text[:400]}
+
+Reply with ONLY a single integer 1, 2, 3, 4, or 5. Nothing else."""
+    try:
+        response = await client.messages.create(
+            model='claude-sonnet-4-6', max_tokens=5,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        score = int(response.content[0].text.strip())
+        return score if 1 <= score <= 5 else -1
+    except:
+        return -1
+
+async def score_batch_async(batch_df):
+    semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
+    completed  = 0
+    total      = len(batch_df)
+    results    = [None] * total
+
+    async def score_with_limit(idx, row):
+        nonlocal completed
+        async with semaphore:
+            result = await score_row_async(row['user'], row['assistant'])
+        results[idx] = result
+        completed += 1
+        if completed % 50 == 0 or completed == total:
+            print(f"  Progress: {completed}/{total} ({completed/total*100:.0f}%)", flush=True)
+
+    tasks = [score_with_limit(i, row) for i, (_, row) in enumerate(batch_df.iterrows())]
+    await asyncio.gather(*tasks)
+    return results
+
+# Resume from checkpoint if exists
+if os.path.exists(SAVE_PATH):
+    df_previous = pd.read_csv(SAVE_PATH)
+    total_valid = (df_previous['quality_score'] >= QUALITY_THRESHOLD).sum()
+    all_scored  = [df_previous]
+    start_idx   = len(df_previous)
+    print(f"Resuming from checkpoint: {start_idx:,} scored, {total_valid:,} valid")
+else:
+    all_scored  = []
+    total_valid = 0
+    start_idx   = 0
+
+df_candidate = df_train.head(MAX_ROWS).sample(frac=1, random_state=42).reset_index(drop=True)
+
+for batch_start in range(start_idx, MAX_ROWS, BATCH_SIZE):
+    batch  = df_candidate.iloc[batch_start:batch_start + BATCH_SIZE].copy()
+    scores = await score_batch_async(batch)      # top-level await works in Colab/Jupyter
+    batch['quality_score'] = scores
+
+    valid_in_batch = (batch['quality_score'] >= QUALITY_THRESHOLD).sum()
+    total_valid   += valid_in_batch
+    all_scored.append(batch)
+
+    pd.concat(all_scored, ignore_index=True).to_csv(SAVE_PATH, index=False)
+    print(f"Batch {batch_start//BATCH_SIZE+1} done — valid: {total_valid:,}/{TARGET_VALID:,}")
+
+    if total_valid >= TARGET_VALID:
+        print("Target reached — stopping early!")
+        break
+
+df_all    = pd.concat(all_scored, ignore_index=True)
+df_valid  = df_all[df_all['quality_score'] >= QUALITY_THRESHOLD]
+df_model2 = df_valid.head(TARGET_VALID)[['system', 'user', 'assistant']].reset_index(drop=True)
+df_model2.to_parquet("data/model2_train.parquet", index=False)
+
+print(f"\nFinal valid rate  : {len(df_valid)/len(df_all)*100:.1f}%")
+print(f"Model 2 train set : {len(df_model2):,} rows saved to data/model2_train.parquet")
+print(f"Scored CSV saved  : {SAVE_PATH}")
